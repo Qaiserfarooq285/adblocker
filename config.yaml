@@ -1,0 +1,484 @@
+# =============================================================================
+# betting-ad-blocker — single source of truth for paths + tunable parameters.
+# Every script in scripts/ loads this file via scripts/common.py::load_config().
+# CLI flags on individual scripts override the values below for that one run;
+# nothing should be hardcoded elsewhere.
+# =============================================================================
+
+paths:
+  raw_videos: data/raw_videos
+  logos: data/logos
+  negatives: data/negatives
+  frames: data/frames
+  annotations_real: data/annotations_real
+  prelabel_review: data/prelabel_review
+  synthetic: data/synthetic
+  dataset: data/dataset
+  data_yaml: data/data.yaml
+  models: models
+  outputs: outputs
+  holdout_preview: outputs/holdout_preview
+
+# ---------------------------------------------------------------------------
+# Frame extraction (scripts/extract_frames.py)
+# ---------------------------------------------------------------------------
+extract:
+  mode: interval            # "interval" = fixed fps sampling, "scene" = ffmpeg scene-change detection
+  fps: 1.0                 # frames per second sampled from each source video (mode: interval)
+  scene_threshold: 0.15     # ffmpeg scene-score cutoff (mode: scene). Lower than the typical
+                             # 0.3-0.4 hard-cut default so subtler changes - like an LED sideline
+                             # board rotating to a different ad - still get captured.
+  parallel_workers: 8       # concurrent ffmpeg seeks for sparse interval sampling (interval >= 2s);
+                             # raise on a many-core machine, lower if disk/CPU contention shows up
+  image_ext: jpg
+  jpg_quality: 95
+
+# ---------------------------------------------------------------------------
+# Synthetic data generation (scripts/generate_synthetic.py)
+# ---------------------------------------------------------------------------
+synthetic:
+  num_images: 4000
+  val_ratio: 0.15
+  logos_per_image_min: 1
+  logos_per_image_max: 3
+  scale_min: 0.04           # logo width as a fraction of background width
+  scale_max: 0.28
+  rotation_deg: 8           # applied as +/- this value
+  perspective_warp_strength: 0.18   # 0 = none, higher = more skew
+  brightness_jitter: 0.25   # +/- fractional jitter
+  contrast_jitter: 0.25
+  blur_prob: 0.35
+  blur_kernel_max: 5
+  jpeg_artifact_prob: 0.4
+  jpeg_quality_min: 35
+  jpeg_quality_max: 75
+  partial_occlusion_prob: 0.25
+  partial_occlusion_max_frac: 0.35   # max fraction of logo cropped off
+  # A pasted logo becomes class `betting_board` when it is perspective-warped
+  # and placed in the lower half of the frame (sideline/pitch-level boards);
+  # it becomes `betting_overlay` when axis-aligned, high-opacity, and placed
+  # near a corner/edge (broadcast graphics burned into the feed).
+  overlay_zone_margin_frac: 0.12     # how close to an edge counts as "corner/edge"
+  board_prob: 0.6                     # fraction of pasted logos placed as betting_board vs betting_overlay
+  strip_prob: 0.4                     # fraction of board logos composed as a whole
+                                       # [logo|slogan|logo] strip on one bar instead of
+                                       # a lone logo - matches the "one polygon per
+                                       # physical strip" labeling convention (README #2)
+  min_visible_area_frac: 0.15         # skip an instance if occlusion/clipping leaves less than this fraction of its mask
+  seed: 1234                          # deterministic train/val split + placement
+
+# ---------------------------------------------------------------------------
+# Person auto-labeling (scripts/autolabel_persons.py)
+# ---------------------------------------------------------------------------
+autolabel:
+  model: yolo11x-seg.pt
+  conf: 0.4
+  batch: 16
+  device: 0
+
+# ---------------------------------------------------------------------------
+# Model-assisted pre-labeling for real annotation (scripts/prelabel_boards.py)
+# ---------------------------------------------------------------------------
+prelabel:
+  conf: 0.15   # deliberately lower than inference.conf - a missed board costs
+                # more at review time than an extra candidate a human rejects
+  device: 0
+
+  # --zero-shot mode: prompt an open-vocabulary segmenter (YOLOE) by text
+  # instead of using our own checkpoint. This is how you get the FIRST round
+  # of real draft labels, before any real annotation exists - a model trained
+  # only on synthetic pastes scores real boards at ~0.07 conf, so it cannot
+  # bootstrap itself. YOLOE knows what a pitchside ad board looks like without
+  # ever having been trained on this dataset.
+  zeroshot:
+    model: yoloe-11l-seg.pt   # -11s-seg is ~3x faster and noticeably blinder on thin boards
+    conf: 0.12
+    imgsz: 2048   # NOT 640. Perimeter boards are ~10px tall once a 4K frame is
+                  # squeezed to 640, and recall collapses. Measured on this
+                  # footage: 2 detections/frame at 1024 vs 8 at 2048.
+    # Prompt -> class mapping. Every prompt under a class name produces draft
+    # labels of that class. These are DRAFTS: YOLOE has no idea which ads are
+    # betting ads, so it flags all pitchside advertising and the reviewer
+    # deletes the non-betting ones. That is still far less work than drawing
+    # every polygon from scratch.
+    # Sport-agnostic on purpose. A betting board is a different physical object
+    # in every sport - a hockey dasher board, a courtside LED, branding printed
+    # flat on an MMA canvas, an outfield wall, an NFL sideline banner - and
+    # football-only prompts ("pitchside advertisement") return almost nothing on
+    # the other four. YOLOE has no idea which ads are BETTING ads, so these
+    # deliberately over-return and the non-betting ones get filtered downstream
+    # against the brand templates and the hard-negative list.
+    prompts:
+      betting_board:
+        - advertising board
+        - led advertising board
+        - stadium advertising
+        - arena advertising banner
+        - courtside advertising board
+        - hockey rink board advertisement
+        - outfield wall advertisement
+        - advertisement printed on the floor
+        - sponsor logo on the wall
+      betting_overlay:
+        - scoreboard
+        - television graphic overlay
+    # Junk filters, as a fraction of full frame area. The upper bound matters:
+    # without it YOLOE happily returns one giant box over the whole crowd.
+    min_area_frac: 0.0005
+    max_area_frac: 0.25
+
+# ---------------------------------------------------------------------------
+# Dataset assembly (scripts/assemble_dataset.py)
+# ---------------------------------------------------------------------------
+assemble:
+  val_ratio: 0.08   # kept low: only ~60 real frames exist and they are the
+                     # scarce resource - better to train on them than to
+                     # grade homework with them (output video is the real val)
+  time_chunk_seconds: 30    # real frames are grouped into per-video time chunks
+                             # of this length before the train/val split, so
+                             # adjacent near-duplicate frames never straddle
+                             # the split boundary
+
+# ---------------------------------------------------------------------------
+# Training (scripts/train.py, notebooks/train_local.ipynb)
+# ---------------------------------------------------------------------------
+train:
+  model: yolo11n-seg.pt      # ships to the Android APK; use yolo11s-seg.pt
+                              # only to measure an accuracy ceiling
+  imgsz: 1280                # NOT 640: perimeter boards are thin strips; at
+                              # 640 they shrink to ~10px tall and recall
+                              # collapses (same failure the zero-shot config
+                              # comment documents). 1280 fits a 12GB card
+                              # with yolo11n-seg and auto batch.
+  epochs: 100
+  batch: -1                  # -1 = Ultralytics auto-fits batch size to the GPU
+  device: 0
+  amp: true
+  workers: 8
+  cache: true
+  patience: 30
+  # Ultralytics always saves to <runs_dir>/<task>/<project>/<name>, i.e.
+  # runs/segment/<project>/<name> here - leave project empty to land directly
+  # at runs/segment/<name> instead of doubling the task name into the path.
+  project: ""
+  name: betting_ad_blocker
+  # Fine-tune defaults used when --weights is passed (see train.py --help)
+  finetune_epochs: 40
+  finetune_lr0: 0.001
+
+# ---------------------------------------------------------------------------
+# Inference / video processing (scripts/process_video.py)
+# ---------------------------------------------------------------------------
+inference:
+  weights: models/best.pt
+  conf: 0.10                 # deliberately LOW: this feeds the tracker, not the
+                              # renderer. Weak detections sustain existing panels
+                              # (see trackers/betting_bytetrack.yaml); actually
+                              # CREATING a panel requires panel_create_conf over
+                              # panel_create_frames consecutive frames.
+  iou: 0.5
+  tracker: trackers/betting_bytetrack.yaml
+  imgsz: 1280                # must match the training resolution class of
+                              # thin far-away boards (640 makes them invisible)
+  device: 0
+
+  # A board segmentation mask is only geometry. Before painting it, require
+  # text matched to a named betting brand in the PDF registry *and* a logo box
+  # from the dedicated detector. This is fail-closed: ambiguous sponsors stay
+  # visible rather than becoming distracting painted blocks.
+  brand_verification:
+    enabled: true
+    logo_weights: runs/detect/runs/logo/merged/weights/best.pt
+    require_logo_detector: true
+    logo_conf: 0.35
+    logo_imgsz: 960
+    ocr_min_height: 112
+    retry_frames: 90
+
+  # --- renderer: frozen board-sourced flat panel (the ONLY fill path) ---
+  panel_feather_px: 4         # 3-5 px feathered edge per spec
+  person_dilate_px: 9         # dilate person masks before subtracting
+
+  # The panel must read as the AD's own colour, muted - a Betano board hides
+  # under muted red, a blue brand under muted blue. Two sources, in order:
+  #
+  #   1. A pinned brand colour: drop `color.json` ({"rgb": [164, 60, 51]}) or
+  #      `color.txt` (a hex string) into input/logos/<brand>/. This is exact
+  #      and immune to a bad frame, which is why it wins when it applies.
+  #   2. Otherwise the LED strip's own colour, sampled once from the middle
+  #      60% x central third of the detection with people excluded - never
+  #      from the whole covered region, which drags in crowd/pitch/dugout
+  #      and averages to a dead grey-brown.
+  #
+  # Muting reduces saturation and brightness ONLY. Hue is left alone: blending
+  # it toward the scene average is what turned the red board olive-brown.
+  brand_color_file: color.json    # also accepts color.txt (hex) in the same folder
+  brand_color_snap_hue: 30        # a sampled colour within this many hue degrees
+                                   # of a pinned brand colour snaps to it; farther
+                                   # away it is left alone, so an unpinned brand
+                                   # never gets painted another brand's colour
+  mute:
+    sample_band_frac: 0.6         # middle 60% horizontally, central third vertically
+    saturation_mult: 0.75         # take the edge off without washing the hue out
+    value_mult: 0.8               # take the shine off
+    scene_blend: 0.0              # DO NOT RAISE without checking the result on a
+                                   # coloured board: this pulls hue toward the
+                                   # scene and is exactly what made red read brown
+    max_relative_brightness: 1.0  # never brighter than the scene average
+
+  # --- panel lifecycle (anti-blink hysteresis) ---
+  panel_create_conf: 0.35     # a panel is born only from detections >= this...
+  panel_create_frames: 3      # ...for this many consecutive frames
+  ema_alpha: 0.12             # geometry smoothing: new = a*det + (1-a)*old.
+                              # Lowered from 0.2: detection jitter was still
+                              # reaching the rendered edge on these sports.
+  # A panel belongs to ONE physical board, so it is matched to the previous
+  # frame by geometry rather than by tracker id - the tracker produced 304
+  # panel births in a 60s hockey clip (~5/second) and every re-birth put the
+  # block somewhere slightly different.
+  panel_match_iou: 0.35
+  # ...and once camera motion is accounted for, a board cannot move far between
+  # frames. Measured teleports of up to 892px on a 1920-wide frame before this.
+  max_corner_step_px: 36
+
+  # A confirmed panel rides the CAMERA, not the detector. The detector jitters a
+  # few pixels every frame and a panel that follows it copies that jitter
+  # faithfully - measured at median 6px / p90 19px of movement with nothing
+  # actually moving, which is what reads as a wobbling block. Locked, the panel
+  # is predicted by the optical-flow affine and corrected toward the detection
+  # only at `lock_correct_alpha` per frame: fast enough to shed affine drift
+  # over a shot, far too slow to see. A wholesale disagreement (overlap below
+  # `resync_iou`) means we are on the wrong object, so it re-syncs outright.
+  lock_geometry: true
+  lock_correct_alpha: 0.03
+  resync_iou: 0.45
+  fade_frames: 5              # panel alpha fades in/out over this many frames
+
+  # A panel with no detection is coasting on camera motion alone, and coasting
+  # is how a ghost panel ends up sliding across open grass in the middle of
+  # the pitch. Propagation exists ONLY to bridge a detector hiccup of a few
+  # frames - never to carry a board that has left the shot.
+  propagation:
+    max_propagation_frames: 14  # these broadcasts cut and pan far more than a
+                                 # football feed, so six frames was dropping
+                                 # panels mid-shot and forcing a fresh 3-frame
+                                 # creation gate plus a 5-frame fade - visible
+                                 # as a blink.
+    verify_content: true        # before drawing a propagated panel, re-check the
+                                 # pixels under it still look like the frozen
+                                 # board colour and not grass
+    content_hue_tol: 85         # an LED board cycles its advert, so its hue
+                                 # legitimately changes while the panel is
+                                 # correctly parked on it. 30 dropped 15 live
+                                 # panels; this only catches gross mismatches.
+    pan_drop_px: 130            # was 25, which fired on 26 normal camera moves:
+                                 # these sports pan constantly and fast. Only a
+                                 # genuine whip-pan should drop a panel now.
+    # Fraction-of-frame box for the field of play. A perimeter board is never
+    # in the middle of the pitch, so a propagated panel whose centre lands here
+    # is a ghost by definition and is dropped on the spot.
+    # FOOTBALL ONLY - null disables it. A courtside LED, a dasher board and an
+    # MMA canvas all live inside this box, so on those sports it drops live
+    # panels (69 of 153 drops measured). Re-enable only for football.
+    field_of_play: null
+    drop_on_grass: false        # likewise: no grass on ice, hardwood or canvas
+
+  # --- whole-strip merging + over-capture clamp ---
+  # Under-capture and over-capture are two ends of the SAME dial. If part of
+  # the strip stays visible, raise panel_margin_frac (pixels of forgiveness) -
+  # NEVER widen merge_gap_height_ratio, which is what lets the panel swallow a
+  # neighboring non-betting board (Kraken/Marriott/Globant) or the crowd.
+  merge_gap_height_ratio: 1.5 # merge same-line betting regions when the
+                              # horizontal gap < this x region height
+  panel_margin_frac: 0.02     # expansion of the merged strip quad AND the hard
+                              # clamp bound: the final panel may never exceed
+                              # the union of its detections + this margin
+                              #
+                              # NOTE this clamp is RELATIVE - the bound is the
+                              # detections themselves plus the margin, so it can
+                              # only catch EMA/propagation drift and can never
+                              # shrink an over-large detection. Measured over
+                              # 247 panel-instances on match.mp4 it reduced
+                              # panel height 0 times. The absolute guard is
+                              # max_board_height_frac, below.
+
+  # --- absolute thin-strip guard ---
+  # Measured PERPENDICULAR to the strip axis, NOT as bounding-box height.
+  # That distinction is the whole point: a perimeter board shot down the
+  # touchline is only ~85px thick but its bounding box spans ~270px (median
+  # 14.2% of frame height on match.mp4) purely because it runs diagonally.
+  # Capping bounding-box height would amputate the far end of a perfectly
+  # good strip. An over-thick detection always overshoots UPWARD into the
+  # crowd, so the trim is anchored at the board's bottom edge.
+  # Measured across the five-sport footage, 73% of real board labels exceeded
+  # the old 0.09: median thickness is 97px (basketball), 158px (hockey), 300px
+  # (MMA canvas) against a 94px cap, so the cap was trimming almost every board
+  # instead of guarding against bad ones. 0.09 is right for a FOOTBALL
+  # perimeter strip and wrong for every other sport here. This is now a sanity
+  # bound, not a shaping tool: p99 across sports is 0.64-0.85.
+  max_board_height_frac: 0.75
+
+  # Reject a bad segment before it reaches the sticky tracker. The thickness
+  # clamp alone cannot make an accidental, 780px panel look acceptable.
+  render_safety:
+    enabled: true
+    max_board_area_frac: 0.12
+    max_board_thickness_frac: 0.30
+    min_board_aspect_ratio: 1.6
+    max_overlay_area_frac: 0.08
+
+  # Pin the panel's lower edge to the board/grass seam found in the image.
+  # The detector's bottom edge is already good to 3-5px, but that shortfall
+  # shows as a red sliver of un-hidden advert along the bottom of the panel.
+  bottom_snap:
+    enabled: true
+    max_shift_frac: 0.35        # of strip thickness; the correction is EMA'd
+                                 # onto the track, never applied raw, because a
+                                 # per-frame re-snap makes the panel vibrate
+
+  # --- who is allowed to punch a hole in the panel ---
+  # A perimeter board has people on BOTH sides and only one side occludes it.
+  # Stewards, subs and the front row stand behind the hoardings: the board
+  # hides them from the shins down, so their visible mask ENDS at the board's
+  # top edge. Someone in front is on the grass, so their mask continues below
+  # the board's bottom edge. Feet position separates the two; mask overlap
+  # does not, which is why the panel used to be full of crowd-shaped notches
+  # along its top edge.
+  occlusion:
+    occlusion_zone_down_frac: 0.25  # zone reaches this far below the board
+    occlusion_zone_up_px: 6         # ...and only a few px above it
+    feet_tolerance_frac: 0.25       # of strip thickness: how far ABOVE the
+                                     # board's bottom edge a person's lowest
+                                     # pixel may sit and still count as in front
+    min_protrusion_frac: 0.5        # a person is far taller than the strip, so
+                                     # a blob fitting ENTIRELY inside the board
+                                     # band is a false positive on the advert,
+                                     # not an occluder. At person_conf 0.10 the
+                                     # black camera pole and the dark patch at
+                                     # the goalmouth both produce these, and
+                                     # they punched holes that exposed legible
+                                     # advert. Must protrude this much (as a
+                                     # fraction of thickness) above the board's
+                                     # top OR below its bottom.
+    min_person_px: 120              # ignore speckle components
+    # The in-front/behind call is LATCHED per track after this many consecutive
+    # frames of positive evidence, and then never revisited. Re-deciding it every
+    # frame is what made the black-kit referee blink: when the detector finds his
+    # torso but misses his legs, the mask's lowest pixel jumps up and the same
+    # man tests as 'behind' for a frame, so the panel paints over him. Nobody
+    # walks from in front of a perimeter board to behind it.
+    front_latch_frames: 2
+    roi_feet_tolerance_frac: 0.6    # generous gate for the ROI pass, whose only
+                                     # job is keeping the crowd out of the track
+                                     # table - not making the in-front call
+
+  # --- last-resort masks for figures BOTH detector passes miss ---
+  # Frame differencing after cancelling camera motion with the panel affine.
+  # A perimeter board is an LED display whose CONTENT ANIMATES, so its own face
+  # frame-differences constantly - blobs must therefore be anchored on the GRASS
+  # below the board (a person in front stands on the pitch; an advert animation
+  # cannot) and be taller than wide. Anything the detector already covers is
+  # excluded, so this only ever adds, never contradicts.
+  motion_person_fallback: true
+  motion_fallback:
+    motion_diff_thresh: 26
+    motion_min_area_px: 900
+
+  # --- goal frame / netting protection ---
+  # The goal stands IN FRONT of the perimeter board, so painting the panel
+  # over it slices the structure in half. Two cues were tried and rejected on
+  # real frames, both recorded because both look right on paper:
+  #   whiteness - half the board is white (the CONFIA wordmark sits on white
+  #               blocks), so this punches holes through the advert.
+  #   thinness  - a white top-hat protected 3x more area in a board-only
+  #               stretch than in the goalmouth: letter strokes are exactly as
+  #               thin as net cord.
+  # What separates them is that a post is TALLER than the board is thick and a
+  # letter cannot be. Hence a vertical morphological opening. Verified on the
+  # left-goal frame: 4145px protected, all of it goal, zero on the lettering.
+  protect_goal:
+    enabled: true
+    vertical_len_frac: 1.2      # opening length as a multiple of strip
+                                 # thickness; must exceed the tallest letter
+    min_vertical_px: 15
+    min_value: 130              # NOT 150 - at 150 the posts are too dim to
+                                 # register at all (they sit in the stand's
+                                 # shadow) and the mask silently returns nothing
+    max_saturation: 100
+    max_width_frac: 0.30        # of strip thickness; a wide bright slab is not a post
+    min_width_px: 5             # ...and net CORD (2-3px) is not one either.
+                                 # Protecting the mesh uncovers the advert
+                                 # behind it - the first run that did so left a
+                                 # legible "Bet" showing at the goalmouth.
+                                 # Netting is semi-transparent so painting over
+                                 # it costs a faint texture; painting over a
+                                 # post cuts a solid white bar in half.
+    min_component_px: 80
+    context_up_frac: 1.5        # search region above/below the panel
+    dilate_px: 3
+    min_below_board_frac: 0.25  # ...and it must stand IN FRONT, by the same test
+                                 # used for people: a goal post is planted on the
+                                 # pitch so it continues below the board's bottom
+                                 # edge onto the grass, while a dugout upright or
+                                 # stanchion has its base hidden behind the
+                                 # hoardings. Without this, the dugout's uprights
+                                 # were protected on a shot with NO goal in it,
+                                 # drawing thin vertical stripes that flickered
+                                 # across the panel.
+
+  # --- dedicated person model (occlusion protection) ---
+  # People ALWAYS win over the panel: when in doubt, show the person. A
+  # one-frame detection miss used to expose whoever was standing in front of
+  # the board (a black-kit referee is the known worst case - dark, low
+  # contrast, easily dropped for a frame), so person masks get the same
+  # anti-blink treatment as boards: tracked ids, held through gaps, and
+  # advanced by the same camera-motion affine.
+  person_model: yolo11s-seg.pt   # stock COCO weights, persons only - our own
+                                  # person head is undertrained by comparison
+  person_conf: 0.10             # lower than the board side on purpose: a false
+                                 # positive person costs a few unhidden pixels,
+                                 # a false negative paints over a human
+  person_tracker: bytetrack.yaml
+  person_hold_frames: 15        # keep a missed person's last mask alive this
+                                 # many frames, warped by the camera motion
+  roi_person_pass: true         # second person pass inside each panel ROI,
+                                 # where a full-frame pass under-detects small
+                                 # near-board figures
+  roi_upscale: 2.0              # the crop is UPSCALED before inference and
+                                 # imgsz is derived from the upscaled crop.
+                                 # The old roi_person_imgsz: 640 ran a ~1100px
+                                 # crop at 0.69x native - a DOWNSCALE, coarser
+                                 # than the full-frame pass it was meant to
+                                 # rescue. At 2.0x it finds 32% more person
+                                 # pixels at the board. ROI detections are also
+                                 # folded into the track table now, so a person
+                                 # only this pass can see is HELD across the
+                                 # next gap instead of blinking.
+  # A DETECTED mask is not necessarily a COMPLETE one, and that distinction is
+  # what actually caused the referee blink. Measured on the 4K clip, frame 711:
+  # the assistant referee's legs and flag were segmented but his black torso was
+  # not, so the panel painted his upper body out while his legs stayed visible.
+  # Holding and latching cannot fix that - a mask existed and was subtracted, it
+  # just did not cover him. The occluder mask is therefore the UNION of the last
+  # N masks per track, each advanced by the camera affine, which makes coverage
+  # monotone through a partial segmentation. Cost is a small halo on a running
+  # figure; people always win, so that is the right direction to err.
+  mask_union_frames: 3
+
+  roi_person_conf: 0.10         # the ROI crop is the one place where a false
+                                 # positive is cheap (a few unhidden pixels) and
+                                 # a miss is expensive (paint over a referee),
+                                 # so it runs even lower than the full frame.
+
+  # --- scene cuts vs fast pans ---
+  scene_cut_min_correl: 0.5   # HSV-hist correlation below this = hard cut
+                              # (tracks cleared); fast pans stay well above it
+
+# ---------------------------------------------------------------------------
+# TFLite export (scripts/export_tflite.py)
+# ---------------------------------------------------------------------------
+export:
+  weights: models/best.pt
+  format: tflite
+  int8: true
+  imgsz: 640

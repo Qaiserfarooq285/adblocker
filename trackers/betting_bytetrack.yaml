@@ -1,0 +1,18 @@
+# Custom ByteTrack config for betting-board panel persistence (Fix B).
+#
+# The stock bytetrack.yaml drops a track the moment detection confidence dips,
+# which is exactly what makes panels blink when conf hovers near the threshold
+# on motion-blurred pans. Here SUSTAINING a track needs only weak evidence
+# (track_low_thresh 0.05) while CREATING one still needs a solid detection
+# (new_track_thresh 0.35) - and process_video.py adds its own K-consecutive-
+# frames rule at panel_create_conf on top before a panel is actually rendered.
+#
+# Inference feeding this tracker runs at conf=0.10 (inference.conf) so those
+# low-confidence frames reach the tracker at all.
+tracker_type: bytetrack
+track_high_thresh: 0.30
+track_low_thresh: 0.05
+new_track_thresh: 0.35
+track_buffer: 60        # frames a lost track is kept alive for re-association
+match_thresh: 0.8
+fuse_score: true

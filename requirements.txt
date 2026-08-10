@@ -1,0 +1,10 @@
+ultralytics>=8.4      # >=8.4 for YOLOE (prelabel_boards.py --zero-shot)
+opencv-python
+numpy
+tqdm
+pyyaml
+lap>=0.5.12
+# YOLOE encodes its text prompts with CLIP. Ultralytics auto-installs this on
+# first --zero-shot run, but pinning it here keeps a fresh env reproducible.
+clip @ git+https://github.com/ultralytics/CLIP.git
+ftfy
